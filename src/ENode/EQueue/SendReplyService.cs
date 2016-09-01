@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
@@ -8,7 +7,6 @@ using ECommon.Components;
 using ECommon.IO;
 using ECommon.Logging;
 using ECommon.Remoting;
-using ECommon.Scheduling;
 using ECommon.Serializing;
 using ECommon.Utilities;
 
@@ -16,30 +14,25 @@ namespace ENode.EQueue
 {
     internal class SendReplyService
     {
-        private readonly ConcurrentDictionary<string, SocketRemotingClientWrapper> _clientWrapperDict;
+        private readonly ConcurrentDictionary<string, SocketRemotingClient> _remotingClientDict;
         private readonly IJsonSerializer _jsonSerializer;
-        private readonly IScheduleService _scheduleService;
         private readonly IOHelper _ioHelper;
         private readonly ILogger _logger;
-        private const int MaxNotActiveTimeSeconds = 300;
-        private const int ScanNotActiveClientInterval = 5000;
 
         public SendReplyService()
         {
-            _clientWrapperDict = new ConcurrentDictionary<string, SocketRemotingClientWrapper>();
+            _remotingClientDict = new ConcurrentDictionary<string, SocketRemotingClient>();
             _jsonSerializer = ObjectContainer.Resolve<IJsonSerializer>();
-            _scheduleService = ObjectContainer.Resolve<IScheduleService>();
             _ioHelper = ObjectContainer.Resolve<IOHelper>();
             _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(GetType().FullName);
         }
 
-        public void Start()
-        {
-            _scheduleService.StartTask("RemoveNotActiveRemotingClient", RemoveNotActiveRemotingClient, 1000, ScanNotActiveClientInterval);
-        }
         public void Stop()
         {
-            _scheduleService.StopTask("RemoveNotActiveRemotingClient");
+            foreach (var remotingClient in _remotingClientDict.Values)
+            {
+                remotingClient.Shutdown();
+            }
         }
         public void SendReply(short replyType, object replyData, string replyAddress)
         {
@@ -48,52 +41,46 @@ namespace ENode.EQueue
                 var context = obj as SendReplyContext;
                 try
                 {
-                    var clientWrapper = GetRemotingClientWrapper(context.ReplyAddress);
-                    if (clientWrapper == null) return;
+                    var remotingClient = GetRemotingClient(context.ReplyAddress);
+                    if (remotingClient == null) return;
+
+                    if (!remotingClient.IsConnected)
+                    {
+                        _logger.Error("Send command reply failed as remotingClient is not connected, replyAddress: " + context.ReplyAddress);
+                        return;
+                    }
 
                     var message = _jsonSerializer.Serialize(context.ReplyData);
                     var body = Encoding.UTF8.GetBytes(message);
                     var request = new RemotingRequest(context.ReplyType, body);
 
-                    clientWrapper.RemotingClient.InvokeOneway(request);
+                    remotingClient.InvokeOneway(request);
                 }
                 catch (Exception ex)
                 {
-                    _logger.Error("Send command reply failed, replyAddress: " + context.ReplyAddress, ex);
+                    _logger.Error("Send command reply has exeption, replyAddress: " + context.ReplyAddress, ex);
                 }
             }, new SendReplyContext(replyType, replyData, replyAddress));
         }
 
-        private void RemoveNotActiveRemotingClient()
+        private SocketRemotingClient GetRemotingClient(string replyAddress)
         {
-            var expiredEntries = _clientWrapperDict.Where(x => x.Value.IsNotActive(MaxNotActiveTimeSeconds));
-            foreach (var entry in expiredEntries)
+            SocketRemotingClient remotingClient;
+            if (_remotingClientDict.TryGetValue(replyAddress, out remotingClient))
             {
-                SocketRemotingClientWrapper clientWrapper;
-                if (_clientWrapperDict.TryRemove(entry.Key, out clientWrapper))
-                {
-                    clientWrapper.RemotingClient.Shutdown();
-                    _logger.InfoFormat("Closed and removed not active remoting client: {0}, lastActiveTime: {1}", entry.Key, clientWrapper.LastActiveTime);
-                }
-            }
-        }
-        private SocketRemotingClientWrapper GetRemotingClientWrapper(string replyAddress)
-        {
-            SocketRemotingClientWrapper remotingClientWrapper;
-            if (_clientWrapperDict.TryGetValue(replyAddress, out remotingClientWrapper))
-            {
-                return remotingClientWrapper;
+                return remotingClient;
             }
 
             var replyEndpoint = TryParseReplyAddress(replyAddress);
             if (replyEndpoint == null) return null;
 
-            _ioHelper.TryIOAction("CreateReplyRemotingClient", () => "replyAddress:" + replyAddress, () =>
-            {
-                remotingClientWrapper = CreateReplyRemotingClient(replyEndpoint);
-            }, 3);
+            _ioHelper.TryIOAction("CreateReplyRemotingClient", () => "replyAddress:" + replyAddress, () => CreateReplyRemotingClient(replyEndpoint), 3);
 
-            return remotingClientWrapper;
+            if (_remotingClientDict.TryGetValue(replyAddress, out remotingClient))
+            {
+                return remotingClient;
+            }
+            return null;
         }
         private IPEndPoint TryParseReplyAddress(string replyAddress)
         {
@@ -109,17 +96,11 @@ namespace ENode.EQueue
                 return null;
             }
         }
-        private SocketRemotingClientWrapper CreateReplyRemotingClient(IPEndPoint replyEndpoint)
+        private SocketRemotingClient CreateReplyRemotingClient(IPEndPoint replyEndpoint)
         {
-            return _clientWrapperDict.GetOrAdd(replyEndpoint.ToString(), key =>
+            return _remotingClientDict.GetOrAdd(replyEndpoint.ToString(), key =>
             {
-                var remotingClient = new SocketRemotingClient(replyEndpoint).Start();
-                return new SocketRemotingClientWrapper
-                {
-                    ReplyEndpoint = replyEndpoint,
-                    RemotingClient = remotingClient,
-                    LastActiveTime = DateTime.Now
-                };
+                return new SocketRemotingClient(replyEndpoint).Start();
             });
         }
 
@@ -134,17 +115,6 @@ namespace ENode.EQueue
                 ReplyType = replyType;
                 ReplyData = replyData;
                 ReplyAddress = replyAddress;
-            }
-        }
-        class SocketRemotingClientWrapper
-        {
-            public IPEndPoint ReplyEndpoint { get; set; }
-            public SocketRemotingClient RemotingClient { get; set; }
-            public DateTime LastActiveTime { get; set; }
-
-            public bool IsNotActive(int maxNotActiveSeconds)
-            {
-                return (DateTime.Now - LastActiveTime).TotalSeconds >= maxNotActiveSeconds;
             }
         }
     }
